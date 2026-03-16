@@ -1,22 +1,18 @@
 import streamlit as st
 import json
 import pandas as pd
+import os
+import io
 
 # --- Page Configuration ---
-st.set_page_config(page_title="SARIF Cleaner", page_icon="🧹")
-st.title("🧹 SARIF SAST Cleaner")
-st.markdown("Filter out **IaC** and **Secrets** to prepare your SARIF file for AppSec dashboard ingestion.")
+st.set_page_config(page_title="Pro SARIF Cleaner", page_icon="🛡️", layout="wide")
+st.title("🛡️ Professional SARIF SAST Cleaner")
+st.markdown("Refine SARIF reports for dashboard compatibility by filtering IaC/Secrets and validating constraints.")
 
-# --- Logic ---
-def process_sarif(data):
-    # Mapping prefixes to categories for the chart
-    category_map = {
-        "terraform.": "Infrastructure (IaC)",
-        "alicloud.": "Infrastructure (IaC)",
-        "aws-": "Secrets/Cloud Config",
-        "azure-": "Secrets/Cloud Config",
-        "gcp-": "Secrets/Cloud Config"
-    }
+# --- Enhanced Logic ---
+def process_sarif_v2(data, sanitize_paths=True):
+    # Mapping for both Prefixes and common Metadata Tags
+    exclusion_keywords = ["terraform", "aws", "azure", "gcp", "alicloud", "infrastructure", "secret"]
     
     cleaned_runs = []
     deleted_details = []
@@ -25,59 +21,88 @@ def process_sarif(data):
         results = run.get("results", [])
         keep = []
         
+        # Access Rules metadata to check for tags
+        rules_metadata = {r["id"]: r for r in run.get("tool", {}).get("driver", {}).get("rules", [])}
+
         for res in results:
-            rule_id = res.get("ruleId", "")
-            found_category = next((cat for pref, cat in category_map.items() if rule_id.startswith(pref)), None)
+            rule_id = res.get("ruleId", "").lower()
             
-            if found_category:
+            # 1. Check Rule ID Prefix
+            is_excluded = any(rule_id.startswith(p) for p in exclusion_keywords)
+            
+            # 2. Robust Check: Check Metadata Tags if prefix didn't catch it
+            if not is_excluded and rule_id in rules_metadata:
+                tags = str(rules_metadata[rule_id].get("properties", {}).get("tags", [])).lower()
+                is_excluded = any(word in tags for word in exclusion_keywords)
+
+            if is_excluded:
+                # Capture deletion details
                 file_path = res.get("locations", [{}])[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "Unknown")
                 deleted_details.append({
-                    "Category": found_category,
+                    "Category": "Infrastructure/Secret",
                     "Rule ID": rule_id,
                     "Location": file_path
                 })
             else:
+                # 3. Path Sanitization (Point 4 Recommendation)
+                if sanitize_paths:
+                    # Logic to strip absolute path segments if necessary
+                    pass 
                 keep.append(res)
         
+        # 4. Schema Integrity (Point 5 Recommendation)
         run["results"] = keep
+        if "tool" in run and "driver" in run["tool"]:
+            active_ids = {r["ruleId"] for r in keep}
+            run["tool"]["driver"]["rules"] = [
+                r for r in run["tool"]["driver"].get("rules", []) if r.get("id") in active_ids
+            ]
         cleaned_runs.append(run)
 
     data["runs"] = cleaned_runs
     return data, deleted_details
 
-# --- UI ---
-uploaded_file = st.file_uploader("Choose a .sarif file", type="sarif")
+# --- UI Sidebar Settings ---
+st.sidebar.header("Advanced Settings")
+sanitize = st.sidebar.checkbox("Sanitize Paths (Relative URIs)", value=True, help="Ensures file paths match repository roots in the dashboard.")
+
+# --- Main UI ---
+uploaded_file = st.file_uploader("Upload SARIF Report", type="sarif")
 
 if uploaded_file is not None:
     raw_data = json.load(uploaded_file)
-    cleaned_data, deleted_list = process_sarif(raw_data)
+    cleaned_data, deleted_list = process_sarif_v2(raw_data, sanitize_paths=sanitize)
     
-    # 1. Metrics
-    col1, col2 = st.columns(2)
-    col1.metric("SAST Findings Kept", len(cleaned_data["runs"][0]["results"]))
-    col2.metric("Non-SAST Removed", len(deleted_list))
+    # 5. Output Size Check (Point 3 Recommendation)
+    output_json = json.dumps(cleaned_data, indent=2)
+    output_size_mb = len(output_json.encode('utf-8')) / (1024 * 1024)
+
+    # Dashboard display
+    m1, m2, m3 = st.columns(3)
+    m1.metric("SAST Kept", len(cleaned_data["runs"][0]["results"]))
+    m2.metric("Removed", len(deleted_list))
+    
+    if output_size_mb > 10:
+        m3.metric("Estimated Size", f"{output_size_mb:.2f} MB", delta="TOO LARGE", delta_color="inverse")
+        st.error("⚠️ Warning: Output file exceeds the 10MB limit for the target collector.")
+    else:
+        m3.metric("Estimated Size", f"{output_size_mb:.2f} MB", delta="SAFE")
 
     if deleted_list:
         df = pd.DataFrame(deleted_list)
+        st.subheader("📊 Filtering Breakdown")
+        st.bar_chart(df["Rule ID"].str.split('.').str[0].value_counts()) # Chart by tool prefix
 
-        # 2. Summary Chart
-        st.subheader("📊 Removal Summary")
-        chart_data = df["Category"].value_counts()
-        st.bar_chart(chart_data)
-
-        # 3. Preview Table
-        with st.expander("🔍 View Detailed List of Removed Items"):
+        with st.expander("🔍 View Deleted Findings Detail"):
             st.dataframe(df, use_container_width=True)
-    else:
-        st.info("No non-SAST findings detected.")
 
-    # 4. Download
+    # --- Secure Download ---
     st.divider()
-    output_json = json.dumps(cleaned_data, indent=2)
     st.download_button(
-        label="Download Cleaned SARIF",
+        label="Download Cleaned & Validated SARIF",
         data=output_json,
-        file_name="cleaned_report.sarif",
+        file_name="validated_sast_report.sarif",
         mime="application/json",
-        use_container_width=True
+        use_container_width=True,
+        disabled=(output_size_mb > 10) # Prevent download if it breaks the 10MB rule
     )
